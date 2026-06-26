@@ -22,17 +22,25 @@ interface VaultSyncSettings {
   pullOnStartup: boolean;
   webhookPort: number;
   webhookSecret: string;
+  gitignoreObsidian: boolean;
+  gitignoreOS: boolean;
+  gitignoreIDE: boolean;
+  gitignoreExtra: string;
 }
 
 const DEFAULTS: VaultSyncSettings = {
-  enabled: true,
+  enabled: false,
   debounceSeconds: 30,
-  pullIntervalSeconds: 300,
+  pullIntervalSeconds: 30,
   commitTemplate: "auto: sync {date}",
   branch: "main",
-  pullOnStartup: true,
+  pullOnStartup: false,
   webhookPort: 0,
   webhookSecret: "",
+  gitignoreObsidian: true,
+  gitignoreOS: true,
+  gitignoreIDE: true,
+  gitignoreExtra: "",
 };
 
 // ─── Git helper ──────────────────────────────────────────────────────────────
@@ -161,6 +169,45 @@ export default class VaultSync extends Plugin {
     }
   }
 
+  async generateGitignore() {
+    const adapter = this.app.vault.adapter as FileSystemAdapter;
+    const sections: string[] = [];
+
+    if (this.settings.gitignoreObsidian) {
+      sections.push("# Obsidian\n.obsidian/\n");
+    }
+
+    if (this.settings.gitignoreOS) {
+      sections.push(
+        "# OS\n" +
+        ".DS_Store\n" +
+        "Thumbs.db\n" +
+        "desktop.ini\n" +
+        "ehthumbs.db\n"
+      );
+    }
+
+    if (this.settings.gitignoreIDE) {
+      sections.push(
+        "# IDE\n" +
+        ".idea/\n" +
+        ".vscode/\n" +
+        "*.iml\n" +
+        ".fleet/\n"
+      );
+    }
+
+    const extra = this.settings.gitignoreExtra.trim();
+    if (extra) {
+      sections.push("# Custom\n" + extra + "\n");
+    }
+
+    const content = sections.join("\n");
+    const exists = await adapter.exists(".gitignore");
+    await adapter.write(".gitignore", content);
+    new Notice(`.gitignore ${exists ? "updated" : "created"}`);
+  }
+
   // ─── Pull interval ─────────────────────────────────────────────────────────
 
   startPollInterval() {
@@ -253,6 +300,7 @@ export default class VaultSync extends Plugin {
 
   private onVaultChange() {
     if (!this.settings.enabled || this.isPaused()) return;
+    if (this.settings.debounceSeconds === 0) return; // 0 = auto-push disabled
     this.clearDebounce();
     this.debounceTimer = setTimeout(
       () => this.sync(),
@@ -512,6 +560,67 @@ class VaultSyncSettingTab extends PluginSettingTab {
         b.setButtonText("Set remote").setCta().onClick(() => this.plugin.setRemote(remoteUrlInput))
       );
 
+    // ── .gitignore ────────────────────────────────────────────────────────
+
+    containerEl.createEl("h3", { text: ".gitignore" });
+    containerEl.createEl("p", {
+      text: "Generate a .gitignore in the vault root. Existing file will be overwritten.",
+      cls: "setting-item-description",
+    });
+
+    new Setting(containerEl)
+      .setName("Ignore .obsidian/")
+      .setDesc("Obsidian workspace and config files")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.gitignoreObsidian).onChange(async (v) => {
+          this.plugin.settings.gitignoreObsidian = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Ignore OS files")
+      .setDesc(".DS_Store, Thumbs.db, desktop.ini…")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.gitignoreOS).onChange(async (v) => {
+          this.plugin.settings.gitignoreOS = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Ignore IDE files")
+      .setDesc(".idea/, .vscode/, *.iml, .fleet/…")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.gitignoreIDE).onChange(async (v) => {
+          this.plugin.settings.gitignoreIDE = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Custom entries")
+      .setDesc("Additional lines to append (one pattern per line)")
+      .addTextArea((t) => {
+        t.setPlaceholder("*.log\nsecrets.md\n…");
+        t.setValue(this.plugin.settings.gitignoreExtra);
+        t.inputEl.rows = 4;
+        t.inputEl.style.width = "100%";
+        t.onChange(async (v) => {
+          this.plugin.settings.gitignoreExtra = v;
+          await this.plugin.saveSettings();
+        });
+        return t;
+      });
+
+    new Setting(containerEl)
+      .addButton((b) =>
+        b
+          .setButtonText("Generate .gitignore")
+          .setCta()
+          .onClick(() => this.plugin.generateGitignore())
+      );
+
     // ── Webhook ───────────────────────────────────────────────────────────
 
     containerEl.createEl("h3", { text: "Webhook" });
@@ -691,15 +800,26 @@ ${authLine}              ${url}`;
     this.guide(containerEl, "First-time setup", `
 If your vault is not yet a git repo:
 
-  1. Click "git init" in the Repository setup section above.
-  2. Create an empty repo on GitHub (no README).
-  3. Paste the clone URL into "Set remote origin" and click Set remote.
-  4. Run an initial push from a terminal:
+  1. Click "git init" in Repository setup.
+  2. Configure .gitignore toggles and click Generate .gitignore.
+  3. Create an empty repo on GitHub (no README, no license).
+  4. Paste the clone URL into "Set remote origin" and click Set remote.
+  5. Run an initial push from a terminal:
        git add . && git commit -m "init" && git push -u origin main
-  5. Enable Auto-sync — the plugin takes over from here.`);
+  6. Enable Auto-sync — the plugin takes over from here.
+
+Tip: if you don't want to sync your Obsidian settings across devices,
+keep "Ignore .obsidian/" on. If you do want shared settings, turn it off.`);
 
     this.guide(containerEl, "How sync works", `
-Every file save starts a debounce timer. When it fires:
+Auto-sync and Pull interval are off by default — enable them once your
+repo is set up and you're ready.
+
+Push debounce = 0 m 0 s  →  auto-push is disabled (manual Sync now only).
+Pull interval = 0 m 0 s  →  background pull is disabled.
+
+When auto-push is active, every file save starts a debounce timer.
+When it fires:
 
   1. git add .
   2. git commit -m "auto: sync <timestamp>"

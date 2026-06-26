@@ -25,28 +25,34 @@ Obsidian plugin that keeps your vault in sync with a Git remote. Every save trig
 
 If your vault is not yet a git repository:
 
-1. Open plugin settings → **Repository setup**
-2. Click **git init** to initialise a repo in the vault directory
-3. Create an empty repo on GitHub (no README)
-4. Paste the clone URL into **Set remote origin** and click **Set remote**
+1. Open plugin settings → **Repository setup** → click **git init**
+2. Go to **.gitignore** section, configure the toggles, and click **Generate .gitignore**
+3. Create an empty repo on GitHub (no README, no license)
+4. Paste the clone URL into **Set remote origin** → click **Set remote**
 5. Run an initial push from a terminal:
    ```bash
    git add . && git commit -m "init" && git push -u origin main
    ```
 6. Enable **Auto-sync** — the plugin takes over from here
 
+> **Tip:** keep "Ignore .obsidian/" on if you don't want to sync Obsidian settings across devices; turn it off if you do.
+
 ## Settings
 
 | Setting | Default | Description |
 |---|---|---|
-| Auto-sync | on | Commit & push on every save |
-| Pull on startup | on | Fetch + pull on open |
-| Push debounce | 0 min 30 sec | Wait after last file change before committing |
-| Pull interval | 5 min 0 sec | Background fetch+pull cadence. 0 = disabled. |
+| Auto-sync | **off** | Commit & push on every save |
+| Pull on startup | **off** | Fetch + pull when Obsidian opens |
+| Push debounce | 0 min 30 sec | Wait after last change before committing. **0 m 0 s = disabled.** |
+| Pull interval | 0 min 30 sec | Background fetch+pull cadence. **0 m 0 s = disabled.** |
 | Commit message | `auto: sync {date}` | `{date}` is replaced with current timestamp |
 | Branch | `main` | Remote branch to push/pull |
 | Webhook port | 0 (off) | Local port for the HTTP trigger endpoint |
 | Webhook secret | — | Optional `Authorization: Bearer <secret>` guard |
+| Ignore .obsidian/ | on | Include `.obsidian/` in generated .gitignore |
+| Ignore OS files | on | `.DS_Store`, `Thumbs.db`, `desktop.ini`… |
+| Ignore IDE files | on | `.idea/`, `.vscode/`, `*.iml`, `.fleet/`… |
+| Custom entries | — | Extra lines appended to the generated .gitignore |
 
 ## How sync works
 
