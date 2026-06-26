@@ -1,7 +1,7 @@
 {
-  "id": "lkmavi-vault-auto-git",
-  "name": "Vault Auto Git",
-  "version": "1.4.2",
+  "id": "lkmavi-smart-git-sync",
+  "name": "Smart Git Sync",
+  "version": "1.4.3",
   "minAppVersion": "1.4.1",
   "description": "Auto git sync — commit & push on every save",
   "author": "lkmavi",
