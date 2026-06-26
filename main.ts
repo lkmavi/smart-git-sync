@@ -8,6 +8,7 @@ import {
   SuggestModal,
 } from "obsidian";
 import { execFile } from "child_process";
+import type { Server } from "http";
 
 // ─── Settings ────────────────────────────────────────────────────────────────
 
@@ -17,6 +18,9 @@ interface VaultSyncSettings {
   commitTemplate: string;
   branch: string;
   pullOnStartup: boolean;
+  pullIntervalMinutes: number;
+  webhookPort: number;
+  webhookSecret: string;
 }
 
 const DEFAULTS: VaultSyncSettings = {
@@ -25,6 +29,9 @@ const DEFAULTS: VaultSyncSettings = {
   commitTemplate: "auto: sync {date}",
   branch: "main",
   pullOnStartup: true,
+  pullIntervalMinutes: 5,
+  webhookPort: 0,
+  webhookSecret: "",
 };
 
 // ─── Git helper ──────────────────────────────────────────────────────────────
@@ -53,6 +60,8 @@ export default class VaultSync extends Plugin {
   private pausedUntil: Date | null = null;
   private syncing = false;
   private lastSyncedAt: Date | null = null;
+  private pullIntervalTimer: ReturnType<typeof setInterval> | null = null;
+  private webhookServer: Server | null = null;
 
   async onload() {
     await this.loadSettings();
@@ -71,13 +80,18 @@ export default class VaultSync extends Plugin {
     this.addSettingTab(new VaultSyncSettingTab(this.app, this));
 
     if (this.settings.enabled && this.settings.pullOnStartup) {
-      await this.pull();
+      await this.pullRemote();
     }
+
+    this.startPollInterval();
+    this.startWebhookServer();
   }
 
   onunload() {
     this.clearDebounce();
     if (this.pauseTimer) clearTimeout(this.pauseTimer);
+    this.stopPollInterval();
+    this.stopWebhookServer();
   }
 
   // ─── Public controls ───────────────────────────────────────────────────────
@@ -88,6 +102,7 @@ export default class VaultSync extends Plugin {
     this.setRibbonIcon(this.settings.enabled ? "cloud-upload" : "cloud-off");
     this.refreshStatusBar();
     new Notice(`Vault Sync ${this.settings.enabled ? "enabled" : "disabled"}`);
+    this.startPollInterval();
   }
 
   pause(ms: number) {
@@ -113,8 +128,90 @@ export default class VaultSync extends Plugin {
 
   async pullNow() {
     new Notice("Vault Sync: pulling…");
-    await this.pull();
-    new Notice("Vault Sync: pull done");
+    try {
+      const updated = await this.pullRemote();
+      new Notice(updated ? "Vault Sync: pulled new changes" : "Vault Sync: already up to date");
+      if (updated) this.refreshStatusBar("synced");
+    } catch (err) {
+      new Notice(`Vault Sync pull failed:\n${(err as Error).message}`, 6000);
+      this.refreshStatusBar("error");
+    }
+  }
+
+  // ─── Pull interval ─────────────────────────────────────────────────────────
+
+  startPollInterval() {
+    this.stopPollInterval();
+    const ms = this.settings.pullIntervalMinutes * 60 * 1000;
+    if (!this.settings.enabled || ms <= 0) return;
+    this.pullIntervalTimer = setInterval(() => this.scheduledPull(), ms);
+  }
+
+  stopPollInterval() {
+    if (this.pullIntervalTimer) {
+      clearInterval(this.pullIntervalTimer);
+      this.pullIntervalTimer = null;
+    }
+  }
+
+  private async scheduledPull() {
+    if (!this.settings.enabled || this.isPaused() || this.syncing) return;
+    try {
+      const updated = await this.pullRemote();
+      if (updated) {
+        new Notice("Vault Sync: pulled new changes from remote");
+        this.refreshStatusBar("synced");
+      }
+    } catch (err) {
+      console.error("[VaultSync] scheduled pull failed", err);
+      this.refreshStatusBar("error");
+    }
+  }
+
+  // ─── Webhook server ────────────────────────────────────────────────────────
+
+  startWebhookServer() {
+    this.stopWebhookServer();
+    const port = this.settings.webhookPort;
+    if (!port || port < 1 || port > 65535) return;
+
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const http = require("node:http") as typeof import("http");
+
+    this.webhookServer = http.createServer((req, res) => {
+      if (req.method !== "POST") {
+        res.writeHead(405).end();
+        return;
+      }
+
+      const secret = this.settings.webhookSecret;
+      if (secret) {
+        const auth = req.headers["authorization"] ?? "";
+        if (auth !== `Bearer ${secret}`) {
+          res.writeHead(401).end("Unauthorized");
+          return;
+        }
+      }
+
+      res.writeHead(202).end("ok");
+      this.pullNow();
+    });
+
+    this.webhookServer.on("error", (err: Error) => {
+      console.error("[VaultSync] webhook error", err);
+      new Notice(`Vault Sync webhook error: ${err.message}`, 6000);
+    });
+
+    this.webhookServer.listen(port, "127.0.0.1", () => {
+      console.log(`[VaultSync] webhook listening on 127.0.0.1:${port}`);
+    });
+  }
+
+  stopWebhookServer() {
+    if (this.webhookServer) {
+      this.webhookServer.close();
+      this.webhookServer = null;
+    }
   }
 
   // ─── Internal ──────────────────────────────────────────────────────────────
@@ -129,6 +226,11 @@ export default class VaultSync extends Plugin {
       id: "sync-now",
       name: "Sync now",
       callback: () => this.syncNow(),
+    });
+    this.addCommand({
+      id: "pull-now",
+      name: "Pull from remote",
+      callback: () => this.pullNow(),
     });
     this.addCommand({
       id: "pause-30m",
@@ -204,13 +306,12 @@ export default class VaultSync extends Plugin {
     }
   }
 
-  private async pull() {
+  private async pullRemote(): Promise<boolean> {
     const cwd = this.vaultPath();
-    try {
-      await git(cwd, ["pull", "--rebase", "origin", this.settings.branch]);
-    } catch (err) {
-      new Notice(`Vault Sync pull failed:\n${(err as Error).message}`, 6000);
-    }
+    const before = await git(cwd, ["rev-parse", "HEAD"]);
+    await git(cwd, ["pull", "--rebase", "origin", this.settings.branch]);
+    const after = await git(cwd, ["rev-parse", "HEAD"]);
+    return before !== after;
   }
 
   isPaused(): boolean {
@@ -232,9 +333,7 @@ export default class VaultSync extends Plugin {
 
   private setRibbonIcon(icon: string) {
     this.ribbonEl.empty();
-    // Obsidian re-renders the icon via the aria-label + SVG swap trick
     (this.ribbonEl as any).dataset.icon = icon;
-    // Simpler: just toggle a CSS class the ribbon uses
     this.ribbonEl.setAttribute("aria-label", `Vault Sync (${this.settings.enabled ? "on" : "off"})`);
   }
 
@@ -355,6 +454,7 @@ class VaultSyncSettingTab extends PluginSettingTab {
         t.setValue(this.plugin.settings.enabled).onChange(async (v) => {
           this.plugin.settings.enabled = v;
           await this.plugin.saveSettings();
+          this.plugin.startPollInterval();
         })
       );
 
@@ -366,6 +466,21 @@ class VaultSyncSettingTab extends PluginSettingTab {
           this.plugin.settings.pullOnStartup = v;
           await this.plugin.saveSettings();
         })
+      );
+
+    new Setting(containerEl)
+      .setName("Pull interval (minutes)")
+      .setDesc("Periodically pull remote changes. 0 = disabled.")
+      .addSlider((s) =>
+        s
+          .setLimits(0, 60, 1)
+          .setValue(this.plugin.settings.pullIntervalMinutes)
+          .setDynamicTooltip()
+          .onChange(async (v) => {
+            this.plugin.settings.pullIntervalMinutes = v;
+            await this.plugin.saveSettings();
+            this.plugin.startPollInterval();
+          })
       );
 
     new Setting(containerEl)
@@ -404,6 +519,41 @@ class VaultSyncSettingTab extends PluginSettingTab {
         })
       );
 
+    containerEl.createEl("h3", { text: "Webhook" });
+    containerEl.createEl("p", {
+      text: "Starts a local HTTP server. Send POST /sync to trigger a pull. " +
+        "Use ngrok / cloudflared / Tailscale to expose it for GitHub Actions.",
+      cls: "setting-item-description",
+    });
+
+    new Setting(containerEl)
+      .setName("Webhook port")
+      .setDesc("Local port to listen on. 0 = disabled. Restarts on change.")
+      .addText((t) =>
+        t
+          .setPlaceholder("0")
+          .setValue(String(this.plugin.settings.webhookPort))
+          .onChange(async (v) => {
+            const port = parseInt(v) || 0;
+            this.plugin.settings.webhookPort = port;
+            await this.plugin.saveSettings();
+            this.plugin.startWebhookServer();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName("Webhook secret")
+      .setDesc("Optional Bearer token. Sent as Authorization: Bearer <secret>.")
+      .addText((t) =>
+        t
+          .setPlaceholder("leave empty to disable auth")
+          .setValue(this.plugin.settings.webhookSecret)
+          .onChange(async (v) => {
+            this.plugin.settings.webhookSecret = v;
+            await this.plugin.saveSettings();
+          })
+      );
+
     containerEl.createEl("h3", { text: "Pause" });
 
     new Setting(containerEl)
@@ -432,5 +582,106 @@ class VaultSyncSettingTab extends PluginSettingTab {
           .setCta()
           .onClick(() => this.plugin.syncNow())
       );
+
+    new Setting(containerEl)
+      .setName("Pull now")
+      .setDesc("Pull latest changes from remote")
+      .addButton((b) =>
+        b.setButtonText("Pull").onClick(() => this.plugin.pullNow())
+      );
+
+    this.renderGuide(containerEl);
+  }
+
+  private renderGuide(containerEl: HTMLElement) {
+    containerEl.createEl("h3", { text: "Setup guide" });
+
+    this.guide(containerEl, "How sync works", `
+Every file save starts a debounce timer (default 30 s). When it fires:
+
+  1. git add .
+  2. git commit -m "auto: sync <timestamp>"
+  3. git pull --rebase origin <branch>   ← absorbs remote changes first
+  4. git push origin <branch>
+
+If pull --rebase hits a real conflict, sync fails and a Notice appears.
+Resolve the conflict in a terminal, then use Sync now from the ribbon menu.`);
+
+    this.guide(containerEl, "Pull interval", `
+When auto-sync is on, the plugin polls git pull --rebase every N minutes
+(configured via Pull interval). A notice appears only when there were
+actual new commits. The pull is skipped if a sync is already running
+or sync is paused.`);
+
+    this.guide(containerEl, "Webhook — local trigger", `
+Set a Webhook port (e.g. 27123) to start a local HTTP server.
+Send a POST request to trigger a pull:
+
+  curl -X POST http://127.0.0.1:27123/sync
+
+If Webhook secret is set, include it as a Bearer token:
+
+  curl -X POST http://127.0.0.1:27123/sync \\
+    -H "Authorization: Bearer your-secret"
+
+The server responds 202 immediately; the pull runs in the background.`);
+
+    this.guide(containerEl, "Webhook — GitHub Actions via Tailscale", `
+Tailscale is the easiest way to let GitHub Actions reach your machine.
+
+1. Install Tailscale on your machine and note your Tailscale IP.
+2. Add the Tailscale GitHub Action to your workflow.
+3. Set VAULT_WEBHOOK_SECRET in your repo secrets.
+
+.github/workflows/notify-vault.yml:
+
+  on:
+    push:
+      branches: [main]
+
+  jobs:
+    notify:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: tailscale/github-action@v2
+          with:
+            authkey: \${{ secrets.TAILSCALE_AUTHKEY }}
+
+        - name: Notify Vault Sync
+          run: |
+            curl -fsS -X POST \\
+              -H "Authorization: Bearer \${{ secrets.VAULT_WEBHOOK_SECRET }}" \\
+              http://<tailscale-ip>:27123/sync`);
+
+    this.guide(containerEl, "Webhook — GitHub Actions via cloudflared", `
+If you don't use Tailscale, expose the port with a cloudflared tunnel:
+
+  cloudflared tunnel --url http://127.0.0.1:27123
+
+Copy the generated *.trycloudflare.com URL and save it as
+VAULT_WEBHOOK_URL in your repo secrets, then:
+
+  - name: Notify Vault Sync
+    run: |
+      curl -fsS -X POST \\
+        -H "Authorization: Bearer \${{ secrets.VAULT_WEBHOOK_SECRET }}" \\
+        \${{ secrets.VAULT_WEBHOOK_URL }}/sync
+
+ngrok works the same way — just replace the URL.`);
+  }
+
+  private guide(containerEl: HTMLElement, title: string, body: string) {
+    const details = containerEl.createEl("details");
+    details.style.marginBottom = "8px";
+    const summary = details.createEl("summary");
+    summary.style.cursor = "pointer";
+    summary.style.fontWeight = "500";
+    summary.setText(title);
+    const pre = details.createEl("pre");
+    pre.style.cssText =
+      "font-size:12px;line-height:1.5;padding:10px 12px;" +
+      "background:var(--background-secondary);border-radius:6px;" +
+      "overflow-x:auto;white-space:pre-wrap;margin-top:6px";
+    pre.setText(body.trim());
   }
 }
