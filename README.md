@@ -15,22 +15,35 @@ Obsidian plugin that keeps your vault in sync with a Git remote. Every save trig
 
 - Desktop only (uses `git` CLI and the local filesystem)
 - `git` must be in `$PATH`
-- The vault directory must already be a git repo with a configured remote
 
 ## Installation
 
 1. Copy `main.js` and `manifest.json` into `.obsidian/plugins/vault-sync/`
 2. Enable the plugin in **Settings → Community plugins**
 
+## First-time setup
+
+If your vault is not yet a git repository:
+
+1. Open plugin settings → **Repository setup**
+2. Click **git init** to initialise a repo in the vault directory
+3. Create an empty repo on GitHub (no README)
+4. Paste the clone URL into **Set remote origin** and click **Set remote**
+5. Run an initial push from a terminal:
+   ```bash
+   git add . && git commit -m "init" && git push -u origin main
+   ```
+6. Enable **Auto-sync** — the plugin takes over from here
+
 ## Settings
 
 | Setting | Default | Description |
 |---|---|---|
 | Auto-sync | on | Commit & push on every save |
-| Pull on startup | on | `git pull --rebase` when Obsidian opens |
-| Pull interval | 5 min | Background pull cadence. 0 = disabled. |
-| Debounce | 30 s | How long to wait after the last change before syncing |
-| Commit message | `auto: sync {date}` | `{date}` is replaced with the current timestamp |
+| Pull on startup | on | Fetch + pull on open |
+| Push debounce | 0 min 30 sec | Wait after last file change before committing |
+| Pull interval | 5 min 0 sec | Background fetch+pull cadence. 0 = disabled. |
+| Commit message | `auto: sync {date}` | `{date}` is replaced with current timestamp |
 | Branch | `main` | Remote branch to push/pull |
 | Webhook port | 0 (off) | Local port for the HTTP trigger endpoint |
 | Webhook secret | — | Optional `Authorization: Bearer <secret>` guard |
@@ -51,7 +64,7 @@ If `pull --rebase` hits a real conflict (same lines edited by two people), the s
 
 ## Pull interval
 
-When auto-sync is on, the plugin polls `git pull --rebase` every N minutes. A notice appears only when there were actual new commits. The pull is skipped if a sync is already in progress or sync is paused.
+On every tick the plugin runs `git fetch origin <branch>` to update the remote ref, then compares `HEAD` vs `origin/<branch>`. A pull only happens when the commits differ — if already up to date, nothing happens and no notice is shown. The fetch + pull is skipped if a sync is already in progress or sync is paused.
 
 ## Webhook
 
@@ -70,13 +83,15 @@ The webhook binds to `127.0.0.1`, so it is not reachable from the internet by de
 
 **Option A — Tailscale** (recommended for personal vaults)
 
-Install Tailscale on your machine. The webhook is reachable from any device on your tailnet:
+The plugin can detect your Tailscale IP automatically:
 
-```
-POST http://<tailscale-ip>:<port>/sync
-```
+1. Install Tailscale on your machine.
+2. Set a **Webhook port** in plugin settings.
+3. Click **Detect** — the plugin runs `tailscale ip -4` and fills in the full webhook URL.
+4. Click **Copy URL** and save it as `VAULT_WEBHOOK_URL` in your repo secrets.
+5. Click **Copy GitHub Actions step** to get a ready-to-paste workflow step.
 
-GitHub Actions can reach it if you add the [Tailscale GitHub Action](https://github.com/tailscale/github-action) to your workflow:
+Full workflow example:
 
 ```yaml
 # .github/workflows/notify-vault.yml
@@ -96,7 +111,7 @@ jobs:
         run: |
           curl -fsS -X POST \
             -H "Authorization: Bearer ${{ secrets.VAULT_WEBHOOK_SECRET }}" \
-            http://<tailscale-ip>:<port>/sync
+            ${{ secrets.VAULT_WEBHOOK_URL }}
 ```
 
 **Option B — cloudflared tunnel**
